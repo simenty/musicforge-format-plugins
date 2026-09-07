@@ -1,0 +1,8 @@
+{
+  "name": "kwm-migration",
+  "api_version": "1.0.0",
+  "kind": "format-adapter",
+  "network": false,
+  "data_sent": ["source_path", "output_dir", "work_root"],
+  "data_not_sent": ["audio_bytes", "cover_bytes"]
+}
