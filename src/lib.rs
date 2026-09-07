@@ -263,6 +263,7 @@ pub fn serve(handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, 
         data_sent: vec!["source_path".into(), "output_dir".into(), "work_root".into()],
         data_not_sent: vec!["audio_bytes".into(), "cover_bytes".into()],
         ack_required: true,
+        extensions: vec!["kwm".into()],
     };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();

@@ -4,6 +4,7 @@
   "kind": "format-adapter",
   "network": false,
   "ack_required": true,
+  "extensions": ["kwm"],
   "data_sent": ["source_path", "output_dir", "work_root"],
   "data_not_sent": ["audio_bytes", "cover_bytes"]
 }
