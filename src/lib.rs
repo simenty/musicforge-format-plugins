@@ -251,6 +251,9 @@ fn quarantine(work: &Path, tmp: &Path) -> Result<PathBuf, String> {
 // ---------------------------------------------------------------- 服务环 --
 
 /// X8 服务环（format 域；manifest/health/shutdown 统一，能力方法交 handler）。
+///
+/// format-adapter 类清单恒声明 `ack_required: true`（PLUGIN_POLICY §3/§4：
+/// 高风险格式迁移必须经主程序确认闸后方可调用，否则 `MF-PLUGIN-ACK-REQUIRED`）。
 pub fn serve(handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>) {
     let manifest = PluginManifest {
         name: std::env::var("MF_PLUGIN_NAME").unwrap_or_else(|_| "format-plugin".into()),
@@ -259,6 +262,7 @@ pub fn serve(handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, 
         network: false,
         data_sent: vec!["source_path".into(), "output_dir".into(), "work_root".into()],
         data_not_sent: vec!["audio_bytes".into(), "cover_bytes".into()],
+        ack_required: true,
     };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
