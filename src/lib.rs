@@ -24,23 +24,26 @@ pub mod fmt_methods {
     pub const FORMAT_MIGRATE: &str = "format.migrate";
 }
 
-/// 迁移请求参数（`format.migrate`）。
+/// 迁移请求参数（P6a-R 协议 v0.1 形状，规格 §5.4；与主仓 FormatMigrateParams 同形）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrateParams {
-    pub work_root: String,
-    pub source_path: String,
-    pub output_dir: String,
-    /// 预留：QMCv2 类需用户自备密钥（本地传递，非网络）
+    pub job_id: String,
+    pub input_path: String,
+    pub output_path: String,
+    /// 插件唯一可写目录（X41 边界 = 原 work_root 语义）
+    pub work_dir: String,
+    /// RFC-0002/X38：QMCv2 类需用户自备密钥（本地传递，非网络）
     pub ekey: Option<String>,
 }
 
 impl MigrateParams {
     pub fn from_value(v: &serde_json::Value) -> Result<Self, String> {
         Ok(Self {
-            work_root: v["work_root"].as_str().ok_or("缺 work_root")?.to_string(),
-            source_path: v["source_path"].as_str().ok_or("缺 source_path")?.to_string(),
-            output_dir: v["output_dir"].as_str().ok_or("缺 output_dir")?.to_string(),
-            ekey: v["ekey"].as_str().map(|s| s.to_string()),
+            job_id: v["job_id"].as_str().ok_or("缺 job_id")?.to_string(),
+            input_path: v["input_path"].as_str().ok_or("缺 input_path")?.to_string(),
+            output_path: v["output_path"].as_str().ok_or("缺 output_path")?.to_string(),
+            work_dir: v["work_dir"].as_str().ok_or("缺 work_dir")?.to_string(),
+            ekey: v["options"]["ekey"].as_str().map(|s| s.to_string()),
         })
     }
 }
@@ -168,9 +171,10 @@ pub fn run_migrate(
     params: &MigrateParams,
     transform: &dyn Fn(&[u8]) -> Vec<u8>,
 ) -> Result<serde_json::Value, String> {
-    let work = PathBuf::from(&params.work_root);
-    let source = guard_path(&work, Path::new(&params.source_path))?;
-    let out_dir = guard_path(&work, Path::new(&params.output_dir))?;
+    let work = PathBuf::from(&params.work_dir);
+    let source = guard_path(&work, Path::new(&params.input_path))?;
+    // v0.1（X41）：产物写在 work_dir 内，经 artifacts 相对路径出站
+    let out_dir = guard_path(&work, &work)?;
     if !source.is_file() {
         return Err(format!("源不是文件: {}", source.display()));
     }
@@ -213,9 +217,13 @@ pub fn run_migrate(
     };
     std::fs::rename(&tmp, &final_target).map_err(|e| format!("原子改名失败: {e}"))?;
     let output_sha = sha256_hex(&final_target)?;
-    // 报告路径用调用方原始形态（canonical 化的 `\\?\` 前缀不外泄）
-    let report_target = Path::new(&params.output_dir).join(format!("{stem}.{ext}"));
+    // 报告路径用调用方原始形态（canonical 化的 `\\?\` 前缀不外泄）；
+    // v0.1（X41）：artifacts = 相对 work_dir 路径 + status/output_format 终态语义
+    let report_target = work.join(format!("{stem}.{ext}"));
     Ok(serde_json::json!({
+        "status": "success",
+        "output_format": ext,
+        "artifacts": [format!("{stem}.{ext}")],
         "output_path": report_target.display().to_string(),
         "verification": {
             "magic": verification.magic,
@@ -228,6 +236,7 @@ pub fn run_migrate(
             "output_sha256": output_sha,
             "quarantined": false,
         },
+        "warnings": [],
     }))
 }
 
@@ -267,10 +276,11 @@ pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_j
         api_version: "1.0.0".into(),
         kind: musicforge_plugin_api::PluginKind::FormatAdapter,
         network: false,
-        data_sent: vec!["source_path".into(), "output_dir".into(), "work_root".into()],
+        data_sent: vec!["input_path".into(), "output_path".into(), "work_dir".into()],
         data_not_sent: vec!["audio_bytes".into(), "cover_bytes".into()],
         ack_required: true,
         extensions: vec!["kwm".into()],
+        permissions: Default::default(),
     };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
@@ -279,9 +289,25 @@ pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_j
         if line.trim().is_empty() {
             continue;
         }
+        // P6a-R（P2）：16MB 单行上限——超限丢该行（协议违规语义）
+        if line.len() > musicforge_plugin_api::v1::MAX_MESSAGE_BYTES {
+            let resp = Response::err("unknown", "MF-PLUGIN-BAD-REQUEST", "消息超过 16MB 上限");
+            let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap());
+            let _ = out.flush();
+            continue;
+        }
         let resp = match serde_json::from_str::<Request>(line.trim()) {
             Err(_) => Response::err("unknown", "MF-PLUGIN-MANIFEST-INVALID", "请求行无法解析"),
             Ok(req) => match req.method.as_str() {
+                // P6a-R（X39）：握手拦截（框架级统一——format 插件免费获得 v0.1 能力）
+                methods::PLUGIN_INIT => Response::ok(
+                    &req.id,
+                    serde_json::to_value(&musicforge_plugin_api::InitResult {
+                        api_version: "1.0.0".into(),
+                        manifest: Some(manifest.clone()),
+                    })
+                    .unwrap(),
+                ),
                 methods::PLUGIN_MANIFEST => {
                     Response::ok(&req.id, serde_json::to_value(&manifest).unwrap())
                 }

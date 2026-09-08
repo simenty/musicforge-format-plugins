@@ -36,11 +36,12 @@ fn uniq_root(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("mf-fmt-{tag}-{n}-{}", std::process::id()))
 }
 
-fn migrate_params(root: &Path, source: &Path, out_dir: &Path) -> MigrateParams {
+fn migrate_params(source: &Path, work_dir: &Path) -> MigrateParams {
     MigrateParams {
-        work_root: root.display().to_string(),
-        source_path: source.display().to_string(),
-        output_dir: out_dir.display().to_string(),
+        job_id: format!("job-{}", std::process::id()),
+        input_path: source.display().to_string(),
+        output_path: work_dir.join("output").display().to_string(),
+        work_dir: work_dir.display().to_string(),
         ekey: None,
     }
 }
@@ -88,13 +89,16 @@ fn migrate_happy_path_verifies_and_audits() {
     std::fs::write(lib.join("song.kwm"), musicforge_format_plugins::kwm::kwm_wrap(&plain))
         .unwrap();
 
-    let out_dir = root.join("out");
+    // v0.1（X41）：源与产物都在 work_dir 内；artifacts 相对路径出站
     let r = run_migrate(
-        &migrate_params(&root, &lib.join("song.kwm"), &out_dir),
+        &migrate_params(&lib.join("song.kwm"), &root),
         &musicforge_format_plugins::kwm::kwm_transform,
     )
     .unwrap();
-    let target = out_dir.join("song.wav");
+    let target = root.join("song.wav");
+    assert_eq!(r["status"], "success");
+    assert_eq!(r["output_format"], "wav");
+    assert_eq!(r["artifacts"], serde_json::json!(["song.wav"]), "artifacts 相对 work_dir");
     assert_eq!(r["output_path"], target.display().to_string());
     assert_eq!(r["verification"]["magic"], "RIFF/WAVE");
     assert_eq!(r["verification"]["sample_rate"], 44100);
@@ -102,7 +106,6 @@ fn migrate_happy_path_verifies_and_audits() {
     assert!(r["audit"]["source_sha256"].as_str().unwrap().len() == 64);
     assert_eq!(r["audit"]["quarantined"], false);
     assert!(target.exists(), "产物必须落盘");
-    assert!(!root.join("out").join("song.migrating.tmp").exists(), "临时文件必须已改名");
 
     // 原源文件原位未动（绝不改源）
     assert!(lib.join("song.kwm").exists());
@@ -118,17 +121,17 @@ fn migrate_refuses_to_overwrite_existing_target() {
     let plain = wav_bytes(44100, 16);
     std::fs::write(lib.join("song.kwm"), musicforge_format_plugins::kwm::kwm_wrap(&plain))
         .unwrap();
-    std::fs::create_dir_all(root.join("out")).unwrap();
-    std::fs::write(root.join("out").join("song.wav"), b"PRE-EXISTING").unwrap();
+    // v0.1：产物在 work_dir 根——预置同位冲突目标
+    std::fs::write(root.join("song.wav"), b"PRE-EXISTING").unwrap();
 
     let err = run_migrate(
-        &migrate_params(&root, &lib.join("song.kwm"), &root.join("out")),
+        &migrate_params(&lib.join("song.kwm"), &root),
         &musicforge_format_plugins::kwm::kwm_transform,
     )
     .unwrap_err();
     assert!(err.contains("MF-OUTPUT-EXISTS"), "覆盖企图必须显式拒绝: {err}");
     assert_eq!(
-        std::fs::read(root.join("out").join("song.wav")).unwrap(),
+        std::fs::read(root.join("song.wav")).unwrap(),
         b"PRE-EXISTING",
         "既有目标内容不变"
     );
@@ -144,7 +147,7 @@ fn migrate_quarantines_garbage_output_and_fails_loudly() {
     std::fs::write(lib.join("junk.kwm"), b"not-a-kwm-file-at-all........").unwrap();
 
     let err = run_migrate(
-        &migrate_params(&root, &lib.join("junk.kwm"), &root.join("out")),
+        &migrate_params(&lib.join("junk.kwm"), &root),
         &|raw| raw.to_vec(),
     )
     .unwrap_err();
@@ -175,8 +178,15 @@ fn kwm_handler_rejects_unknown_method_loudly() {
 
 #[test]
 fn migrate_params_rejects_missing_fields() {
-    let err = MigrateParams::from_value(&serde_json::json!({"work_root": "x"})).unwrap_err();
-    assert!(err.contains("source_path"), "缺字段显式报错: {err}");
+    let err = MigrateParams::from_value(&serde_json::json!({"job_id": "j"})).unwrap_err();
+    assert!(err.contains("input_path"), "缺字段显式报错: {err}");
+    // v0.1：ekey 走 options 包裹（RFC-0002/X38）
+    let p = MigrateParams::from_value(&serde_json::json!({
+        "job_id": "j", "input_path": "a", "output_path": "b", "work_dir": "w",
+        "options": {"ekey": "k"}
+    }))
+    .unwrap();
+    assert_eq!(p.ekey.as_deref(), Some("k"));
     assert_eq!(fmt_methods::FORMAT_MIGRATE, "format.migrate");
 }
 
@@ -191,9 +201,7 @@ fn binary_serves_manifest_and_migrate_over_stdio() {
 
     let root = uniq_root("bin");
     let lib = root.join("lib");
-    let out_dir = root.join("out");
     std::fs::create_dir_all(&lib).unwrap();
-    std::fs::create_dir_all(&out_dir).unwrap();
     let plain = wav_bytes(44100, 16);
     std::fs::write(
         lib.join("song.kwm"),
@@ -207,11 +215,17 @@ fn binary_serves_manifest_and_migrate_over_stdio() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let req1 = serde_json::json!({"id":"r1","method":"plugin.manifest","params":{}});
+    // P6a-R：init 握手（v0.1）先行 + format.migrate（v0.1 形状，X41 出站）
+    let req1 = serde_json::json!({"id":"r1","method":"plugin.init","params":{
+        "protocol_version": 1, "work_dir": root.display().to_string(),
+        "locale": "zh-CN", "host_capabilities": {"batch": false, "events": false, "artifacts": true}
+    }});
     let req2 = serde_json::json!({"id":"r2","method":"format.migrate","params":{
-        "work_root": root.display().to_string(),
-        "source_path": lib.join("song.kwm").display().to_string(),
-        "output_dir": out_dir.display().to_string(),
+        "job_id": "job-bin",
+        "input_path": lib.join("song.kwm").display().to_string(),
+        "output_path": root.join("output").display().to_string(),
+        "work_dir": root.display().to_string(),
+        "options": {}
     }});
     writeln!(stdin, "{}", req1).unwrap();
     writeln!(stdin, "{}", req2).unwrap();
@@ -227,15 +241,26 @@ fn binary_serves_manifest_and_migrate_over_stdio() {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "恰两行响应: {out}");
     let m: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(m["result"]["kind"], "format-adapter", "L3 类别声明: {m}");
-    assert_eq!(m["result"]["network"], false, "格式插件强制离线");
+    assert_eq!(m["result"]["api_version"], "1.0.0", "init 返回协议版本");
+    assert_eq!(
+        m["result"]["manifest"]["kind"],
+        "format-adapter",
+        "L3 类别声明: {m}"
+    );
+    assert_eq!(m["result"]["manifest"]["network"], false, "格式插件强制离线");
     // 稳定审计 B9 回归：清单名必须与 plugin.json/name 一致（此前环境变量缺省
     // 漂移为 "format-plugin" → ACK 闸永远失败）
-    assert_eq!(m["result"]["name"], "kwm-migration", "B9: 清单名不得漂移");
+    assert_eq!(
+        m["result"]["manifest"]["name"],
+        "kwm-migration",
+        "B9: 清单名不得漂移"
+    );
     let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["result"]["status"], "success");
+    assert_eq!(r2["result"]["artifacts"], serde_json::json!(["song.wav"]));
     assert_eq!(r2["result"]["verification"]["magic"], "RIFF/WAVE");
     assert_eq!(r2["result"]["verification"]["sample_rate"], 44100);
-    assert!(out_dir.join("song.wav").exists(), "迁移产物必须落盘");
+    assert!(root.join("song.wav").exists(), "迁移产物必须落盘（work_dir 内）");
 
     let status = child.wait().unwrap();
     assert!(status.success());

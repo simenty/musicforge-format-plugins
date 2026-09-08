@@ -5,6 +5,6 @@
   "network": false,
   "ack_required": true,
   "extensions": ["kwm"],
-  "data_sent": ["source_path", "output_dir", "work_root"],
+  "data_sent": ["input_path", "output_path", "work_dir"],
   "data_not_sent": ["audio_bytes", "cover_bytes"]
 }
