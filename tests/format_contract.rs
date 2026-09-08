@@ -229,6 +229,9 @@ fn binary_serves_manifest_and_migrate_over_stdio() {
     let m: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(m["result"]["kind"], "format-adapter", "L3 类别声明: {m}");
     assert_eq!(m["result"]["network"], false, "格式插件强制离线");
+    // 稳定审计 B9 回归：清单名必须与 plugin.json/name 一致（此前环境变量缺省
+    // 漂移为 "format-plugin" → ACK 闸永远失败）
+    assert_eq!(m["result"]["name"], "kwm-migration", "B9: 清单名不得漂移");
     let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(r2["result"]["verification"]["magic"], "RIFF/WAVE");
     assert_eq!(r2["result"]["verification"]["sample_rate"], 44100);

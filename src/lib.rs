@@ -232,12 +232,15 @@ pub fn run_migrate(
 }
 
 /// 失败产物移入 `work_root/.musicforge/quarantine/<task>/`（隔离不删除）。
+///
+/// 稳定审计 B8：task id 含纳秒（毫秒+pid 在同进程连续失败时可能撞名 →
+/// rename 入已存在的隔离目录会失败并掩盖原始错误）。
 fn quarantine(work: &Path, tmp: &Path) -> Result<PathBuf, String> {
     let task = format!(
         "{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|d| d.as_nanos())
             .unwrap_or(0),
         std::process::id()
     );
@@ -254,9 +257,13 @@ fn quarantine(work: &Path, tmp: &Path) -> Result<PathBuf, String> {
 ///
 /// format-adapter 类清单恒声明 `ack_required: true`（PLUGIN_POLICY §3/§4：
 /// 高风险格式迁移必须经主程序确认闸后方可调用，否则 `MF-PLUGIN-ACK-REQUIRED`）。
-pub fn serve(handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>) {
+///
+/// 稳定审计 B9（2026-09-08 第二轮）：清单 `name` 由调用方显式传入——此前取自
+/// 环境变量且 bin 未设置 → 默认 "format-plugin" ≠ plugin.json/ACK 记录中的
+/// 真名 → ACK 闸永远失败。**清单名必须与 plugin.json/name 逐字节一致**。
+pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>) {
     let manifest = PluginManifest {
-        name: std::env::var("MF_PLUGIN_NAME").unwrap_or_else(|_| "format-plugin".into()),
+        name: name.to_string(),
         api_version: "1.0.0".into(),
         kind: musicforge_plugin_api::PluginKind::FormatAdapter,
         network: false,

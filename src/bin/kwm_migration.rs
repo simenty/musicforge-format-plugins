@@ -4,5 +4,7 @@
 //! 仅处理用户合法持有的本地文件；术语为「本地格式迁移/备份」，绝不联网。
 
 fn main() {
-    musicforge_format_plugins::serve(musicforge_format_plugins::kwm::handler);
+    // 名字必须与 plugins/kwm-migration/plugin.json 的 name 逐字节一致
+    // （ACK 闸 / Host 清单核对 / config.acked 均以该名为键）
+    musicforge_format_plugins::serve("kwm-migration", musicforge_format_plugins::kwm::handler);
 }
