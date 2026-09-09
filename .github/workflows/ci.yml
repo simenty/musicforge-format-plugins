@@ -23,7 +23,11 @@ jobs:
         with:
           repository: simenty/MusicForge
           ref: master
-          path: ../MusicForge
+          path: _MusicForge
+      # path 依赖写作 ../MusicForge（本地布局）；CI 中以 symlink 对齐
+      # （checkout action 不允许 path 逃逸 workspace）
+      - name: Link 协议 crate 路径
+        run: ln -s "$GITHUB_WORKSPACE/_MusicForge" "$GITHUB_WORKSPACE/../MusicForge"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
