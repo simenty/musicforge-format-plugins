@@ -6,5 +6,10 @@
 fn main() {
     // 名字必须与 plugins/kwm-migration/plugin.json 的 name 逐字节一致
     // （ACK 闸 / Host 清单核对 / config.acked 均以该名为键）
-    musicforge_format_plugins::serve("kwm-migration", musicforge_format_plugins::kwm::handler);
+    // RFC2-T1：扩展名声明与 plugin.json 逐项一致（PLUGIN_POLICY §4）
+    musicforge_format_plugins::serve(
+        "kwm-migration",
+        &["kwm"],
+        musicforge_format_plugins::kwm::handler,
+    );
 }

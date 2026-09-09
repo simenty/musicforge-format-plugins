@@ -1,0 +1,54 @@
+name: CI (format-plugins)
+
+# L3 格式迁移插件仓 CI：
+#   1. fmt / clippy(-D warnings) / 全量离线测试（roundtrip/守卫/隔离/协议）
+#   2. no-bundled-ekeys 断言（RFC-0002 §5 验收 6 / §2.3 法务红线：
+#      永不内置账户级机密——静态密钥表除外（X48 裁决 3）；ekey 派生实现禁入）
+#
+# 协议 crate 为 path 依赖 ../MusicForge——CI 协同 checkout 主仓对齐路径。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout 主仓（协议 crate path 依赖对齐）
+        uses: actions/checkout@v4
+        with:
+          repository: simenty/MusicForge
+          ref: master
+          path: ../MusicForge
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # RFC-0002 §5 验收 6：无内置 ekey / 账户级机密（X48 裁决）
+      - name: no-bundled-ekeys 断言
+        run: |
+          set -e
+          # 1) 64+ 位十六进制字符串常量 = 疑似 ekey（静态表是 128B 字节数组，不匹配）
+          if grep -rniE '"[0-9a-f]{64,}"' src/ plugins/; then
+            echo "::error::发现疑似内置 ekey 常量（no bundled secrets 红线）"; exit 1
+          fi
+          # 2) ekey 派生/TEA 解密实现禁入（X48：STag/QTag 走 D 级识别报告）
+          if grep -rniE 'qqtea|tea_decrypt|ekey_decrypt|derive_ekey' src/; then
+            echo "::error::发现疑似 ekey 派生实现（X48 D 级裁决红线）"; exit 1
+          fi
+          echo "无内置 ekey / 派生实现 ✓"
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test（全离线）
+        run: cargo test --workspace

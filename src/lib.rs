@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use musicforge_plugin_api::{methods, PluginError, PluginManifest, Request, Response};
 
 pub mod kwm;
+pub mod qmc;
 
 /// format 域方法（P6b 增量；协议信封与 AI 域共用 X8）。
 pub mod fmt_methods {
@@ -41,7 +42,10 @@ impl MigrateParams {
         Ok(Self {
             job_id: v["job_id"].as_str().ok_or("缺 job_id")?.to_string(),
             input_path: v["input_path"].as_str().ok_or("缺 input_path")?.to_string(),
-            output_path: v["output_path"].as_str().ok_or("缺 output_path")?.to_string(),
+            output_path: v["output_path"]
+                .as_str()
+                .ok_or("缺 output_path")?
+                .to_string(),
             work_dir: v["work_dir"].as_str().ok_or("缺 work_dir")?.to_string(),
             ekey: v["options"]["ekey"].as_str().map(|s| s.to_string()),
         })
@@ -122,12 +126,14 @@ pub fn guard_path(work_root: &Path, path: &Path) -> Result<PathBuf, String> {
 
 // ---------------------------------------------------------------- 校验器 --
 
-/// magic 嗅探（无损音频三形态）。
+/// magic 嗅探（无损音频四形态；RFC2-T2：+OggS——QMC ogg 系变体产物必需）。
 pub fn sniff_magic(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"fLaC") {
         Some("fLaC")
     } else if data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WAVE" {
         Some("RIFF/WAVE")
+    } else if data.starts_with(b"OggS") {
+        Some("OggS")
     } else if data.starts_with(b"ID3") || data.starts_with(&[0xFF, 0xFB]) {
         Some("ID3/MP3")
     } else {
@@ -140,10 +146,16 @@ pub fn verify_output(path: &Path) -> Result<Verification, String> {
     use lofty::prelude::*;
     let data = std::fs::read(path).map_err(|e| format!("产物读取失败: {e}"))?;
     let magic = sniff_magic(&data).ok_or("产物 magic 校验失败：不是可识别的无损音频")?;
-    let props = lofty::read_from_path(path).ok().map(|t| t.properties().clone());
+    let props = lofty::read_from_path(path)
+        .ok()
+        .map(|t| t.properties().clone());
     let (sr, ch, dur) = match &props {
         // lofty 0.25：sample_rate()/channels() 本身返回 Option（CODEBUDDY 高频坑）
-        Some(p) => (p.sample_rate(), p.channels().map(|c| c as u16), Some(p.duration().as_secs_f64())),
+        Some(p) => (
+            p.sample_rate(),
+            p.channels().map(|c| c as u16),
+            Some(p.duration().as_secs_f64()),
+        ),
         None => (None, None, None),
     };
     Ok(Verification {
@@ -169,7 +181,7 @@ pub fn sha256_hex(path: &Path) -> Result<String, String> {
 /// `transform` 为各格式的纯字节变换（如 XOR 解密）。
 pub fn run_migrate(
     params: &MigrateParams,
-    transform: &dyn Fn(&[u8]) -> Vec<u8>,
+    transform: &dyn Fn(&[u8], &MigrateParams) -> Vec<u8>,
 ) -> Result<serde_json::Value, String> {
     let work = PathBuf::from(&params.work_dir);
     let source = guard_path(&work, Path::new(&params.input_path))?;
@@ -180,13 +192,14 @@ pub fn run_migrate(
     }
     let source_sha = sha256_hex(&source)?;
     let raw = std::fs::read(&source).map_err(|e| format!("源读取失败: {e}"))?;
-    let migrated = transform(&raw);
+    let migrated = transform(&raw, params);
 
     // 扩展名据 magic 决定；未知形态 → "bin"（先落临时，双验失败 → 隔离区，
     // 绝不在写盘前静默丢弃产物——留痕是审计铁律）
     let ext = match sniff_magic(&migrated) {
         Some("fLaC") => "flac",
         Some("RIFF/WAVE") => "wav",
+        Some("OggS") => "ogg",
         Some(_) => "mp3",
         None => "bin",
     };
@@ -270,7 +283,11 @@ fn quarantine(work: &Path, tmp: &Path) -> Result<PathBuf, String> {
 /// 稳定审计 B9（2026-09-08 第二轮）：清单 `name` 由调用方显式传入——此前取自
 /// 环境变量且 bin 未设置 → 默认 "format-plugin" ≠ plugin.json/ACK 记录中的
 /// 真名 → ACK 闸永远失败。**清单名必须与 plugin.json/name 逐字节一致**。
-pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>) {
+pub fn serve(
+    name: &str,
+    extensions: &[&str],
+    handler: fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+) {
     let manifest = PluginManifest {
         name: name.to_string(),
         api_version: "1.0.0".into(),
@@ -279,7 +296,9 @@ pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_j
         data_sent: vec!["input_path".into(), "output_path".into(), "work_dir".into()],
         data_not_sent: vec!["audio_bytes".into(), "cover_bytes".into()],
         ack_required: true,
-        extensions: vec!["kwm".into()],
+        // RFC2-T1：扩展名声明参数化（kwm-migration / qmc-migration 共用服务环，
+        // 清单 extensions 与 plugin.json 逐项一致——按格式申报兼容性，PLUGIN_POLICY §4）
+        extensions: extensions.iter().map(|s| s.to_string()).collect(),
         permissions: Default::default(),
     };
     let stdin = std::io::stdin();
@@ -311,10 +330,9 @@ pub fn serve(name: &str, handler: fn(&str, &serde_json::Value) -> Result<serde_j
                 methods::PLUGIN_MANIFEST => {
                     Response::ok(&req.id, serde_json::to_value(&manifest).unwrap())
                 }
-                methods::PLUGIN_HEALTH => Response::ok(
-                    &req.id,
-                    serde_json::json!({"status": "ok"}),
-                ),
+                methods::PLUGIN_HEALTH => {
+                    Response::ok(&req.id, serde_json::json!({"status": "ok"}))
+                }
                 methods::PLUGIN_SHUTDOWN => {
                     let resp = Response::ok(
                         &req.id,

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "kwm-migration"
 path = "src/bin/kwm_migration.rs"
 
+[[bin]]
+name = "qmc-migration"
+path = "src/bin/qmc_migration.rs"
+
 [dependencies]
 musicforge-plugin-api = { path = "../MusicForge/musicforge-plugin-api" }
 serde_json = "1"

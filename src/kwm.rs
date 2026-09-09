@@ -57,12 +57,7 @@ pub fn kwm_wrap(plaintext: &[u8]) -> Vec<u8> {
     head.copy_from_slice(&block);
     let key = KWM_KEY16;
     let mut out = head.to_vec();
-    out.extend(
-        plaintext
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ key[i % 16]),
-    );
+    out.extend(plaintext.iter().enumerate().map(|(i, b)| b ^ key[i % 16]));
     out
 }
 
@@ -72,7 +67,7 @@ pub fn handler(method: &str, params: &serde_json::Value) -> Result<serde_json::V
         super::fmt_methods::FORMAT_MIGRATE => {
             let p = crate::MigrateParams::from_value(params)
                 .map_err(|e| format!("MF-PLUGIN-MANIFEST-INVALID: {e}"))?;
-            crate::run_migrate(&p, &kwm_transform)
+            crate::run_migrate(&p, &|raw, _p| kwm_transform(raw))
         }
         other => Err(format!(
             "MF-PLUGIN-METHOD-UNKNOWN: 本插件不服务该方法: {other}"
