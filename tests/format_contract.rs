@@ -259,17 +259,18 @@ fn qmc_static_roundtrip_flac_migrates_and_verifies() {
 }
 
 #[test]
-fn qmc_stag_tail_explicit_refusal() {
+fn qmc_stag_requires_ekey_and_rejects_invalid() {
     let root = uniq_root("qmc-stag");
     let lib = root.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
-    // 合成 STag 尾标形态：载荷 + STag magic（RFC §5：尾探测优先于扩展名）
-    let mut raw = flac_bytes(); // 载荷形似 flac（仅 fixture 语义）
+    // 合成 STag 尾标形态：载荷 + 最末 4 字节 STag magic（RFC §5 / X49 End(-4)）
+    let mut raw = flac_bytes();
     raw.extend_from_slice(&[0u8; 128]);
-    raw.extend_from_slice(b"STag\x10\x00\x00\x00");
+    raw.extend_from_slice(b"STag");
     std::fs::write(lib.join("song.mflac"), &raw).unwrap();
     let before = std::fs::read(lib.join("song.mflac")).unwrap();
 
+    // ① 无 ekey → QMC-EKEY-REQUIRED（引导文案；X42 双层模型 source_code 透传）
     let err = musicforge_format_plugins::qmc::handler(
         "format.migrate",
         &serde_json::json!({
@@ -277,27 +278,85 @@ fn qmc_stag_tail_explicit_refusal() {
             "input_path": lib.join("song.mflac").display().to_string(),
             "output_path": root.join("output").display().to_string(),
             "work_dir": root.display().to_string(),
-            "options": {"ekey": "SOME-EKEY"}
+            "options": {}
         }),
     )
     .unwrap_err();
-    // X42 双层模型：业务码前缀透传（host 提取 source_code）
     assert!(
-        err.starts_with("QMC-VARIANT-STAG-UNSUPPORTED"),
-        "STag = 账号绑定 DRM，显式拒绝: {err}"
+        err.starts_with("QMC-EKEY-REQUIRED"),
+        "ekey 缺失必须显式引导: {err}"
     );
-    // 源文件原样保留；无任何产物落盘
+    assert_eq!(
+        std::fs::read(lib.join("song.mflac")).unwrap(),
+        before,
+        "源原样"
+    );
+    assert!(!root.join("song.flac").exists(), "无产物落盘");
+
+    // ② 错误 ekey → QMC-EKEY-INVALID（不进入执行、不落盘）
+    let err = musicforge_format_plugins::qmc::handler(
+        "format.migrate",
+        &serde_json::json!({
+            "job_id": "j",
+            "input_path": lib.join("song.mflac").display().to_string(),
+            "output_path": root.join("output").display().to_string(),
+            "work_dir": root.display().to_string(),
+            "options": {"ekey": "definitely-not-an-ekey"}
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("QMC-EKEY-INVALID"),
+        "ekey 无效必须显式报错: {err}"
+    );
     assert_eq!(std::fs::read(lib.join("song.mflac")).unwrap(), before);
     assert!(!root.join("song.flac").exists());
     std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
-fn qmc_stag_by_extension_without_tail_also_refused() {
+fn qmc_stag_roundtrip_with_valid_ekey() {
+    let root = uniq_root("qmc-stag-ok");
+    let lib = root.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    // ekey 参考fixture → key（38B "This is a test key..." → Map 变体）
+    let ekey = "VGhpcyBpcyBHFWEh4cjZ1Vi7rJ56XeoPlqGM1sxBGPg7mt89umKclFBr9iqfmFdS";
+    let cipher = musicforge_format_plugins::qmc2v2::Qmc2Cipher::from_ekey(ekey).unwrap();
+    // 加密端 = 解密端 XOR 自逆镜像：明文 FLAC → QMCv2 密文 + 最末 4 字节 STag
+    let plain = flac_bytes();
+    let mut raw = cipher.decrypt(&plain);
+    raw.extend_from_slice(b"STag");
+    std::fs::write(lib.join("song.mflac0"), &raw).unwrap();
+
+    let r = musicforge_format_plugins::qmc::handler(
+        "format.migrate",
+        &serde_json::json!({
+            "job_id": "j",
+            "input_path": lib.join("song.mflac0").display().to_string(),
+            "output_path": root.join("output").display().to_string(),
+            "work_dir": root.display().to_string(),
+            "options": {"ekey": ekey}
+        }),
+    )
+    .unwrap();
+
+    let target = root.join("song.flac");
+    assert_eq!(r["status"], "success");
+    assert_eq!(r["output_format"], "flac", "STag(mflac0) → flac（附录 D）");
+    assert_eq!(r["verification"]["magic"], "fLaC");
+    assert_eq!(r["verification"]["sample_rate"], 44100);
+    assert!(target.exists(), "解封装直出落盘（RFC §5 验收 4/X49）");
+    assert!(lib.join("song.mflac0").exists(), "源原样（绝不改源）");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn qmc_stag_by_extension_without_tail_requires_ekey() {
     let root = uniq_root("qmc-mflac1");
     let lib = root.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
-    // .mflac1 无实测尾标：按附录 D 声明保守归尾标家族（requires_ekey 语义）
+    // .mflac1 无实测尾标：按附录 D 声明保守归 STag 家族（requires_ekey 语义）
     std::fs::write(lib.join("song.mflac1"), b"payload-without-tag........").unwrap();
 
     let err = musicforge_format_plugins::qmc::handler(
@@ -311,7 +370,36 @@ fn qmc_stag_by_extension_without_tail_also_refused() {
         }),
     )
     .unwrap_err();
-    assert!(err.starts_with("QMC-VARIANT-STAG-UNSUPPORTED"), "{err}");
+    assert!(err.starts_with("QMC-EKEY-REQUIRED"), "{err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn qmc_qtag_tail_stays_d_level_report() {
+    let root = uniq_root("qmc-qtag");
+    let lib = root.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    // QTag 尾标（mgg 系）：内嵌 ekey 结构，参考源未覆盖 → 维持 D 级（X49）
+    let mut raw = flac_bytes();
+    raw.extend_from_slice(&[0u8; 64]);
+    raw.extend_from_slice(b"QTag");
+    std::fs::write(lib.join("song.mgg1"), &raw).unwrap();
+
+    let err = musicforge_format_plugins::qmc::handler(
+        "format.migrate",
+        &serde_json::json!({
+            "job_id": "j",
+            "input_path": lib.join("song.mgg1").display().to_string(),
+            "output_path": root.join("output").display().to_string(),
+            "work_dir": root.display().to_string(),
+            "options": {"ekey": "whatever"}
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("QMC-VARIANT-QTAG-UNSUPPORTED"),
+        "QTag 维持 D 级识别报告: {err}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

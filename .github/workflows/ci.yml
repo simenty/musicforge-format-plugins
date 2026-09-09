@@ -34,19 +34,21 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # RFC-0002 §5 验收 6：无内置 ekey / 账户级机密（X48 裁决）
+      # RFC-0002 §5 验收 6 + X49 语义更新：无 ekey 数据库、无网络栈
+      # （ekey 派生已随 X49 合法落地——用户自备 ekey 离线解密；
+      #   红线 = 在线获取/账户凭据/musicex）
       - name: no-bundled-ekeys 断言
         run: |
           set -e
-          # 1) 64+ 位十六进制字符串常量 = 疑似 ekey（静态表是 128B 字节数组，不匹配）
+          # 1) 64+ 位十六进制字符串常量 = 疑似 ekey 数据库（静态表是 128B 字节数组，不匹配）
           if grep -rniE '"[0-9a-f]{64,}"' src/ plugins/; then
             echo "::error::发现疑似内置 ekey 常量（no bundled secrets 红线）"; exit 1
           fi
-          # 2) ekey 派生/TEA 解密实现禁入（X48：STag/QTag 走 D 级识别报告）
-          if grep -rniE 'qqtea|tea_decrypt|ekey_decrypt|derive_ekey' src/; then
-            echo "::error::发现疑似 ekey 派生实现（X48 D 级裁决红线）"; exit 1
+          # 2) 网络栈禁入（X49：ekey/密钥只能本地传递——零网络铁律）
+          if grep -rniE 'reqwest|ureq|hyper|attohttpc' src/ Cargo.toml; then
+            echo "::error::发现网络栈依赖（零网络铁律红线）"; exit 1
           fi
-          echo "无内置 ekey / 派生实现 ✓"
+          echo "无 ekey 数据库 / 无网络栈 ✓"
 
       - name: fmt
         run: cargo fmt --all --check

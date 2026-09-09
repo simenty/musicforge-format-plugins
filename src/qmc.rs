@@ -1,18 +1,19 @@
-//! `qmc-migration`（QQ 音乐 QMC 系，RFC-0002 / X48 裁决）。
+//! `qmc-migration`（QQ 音乐 QMC 系，RFC-0002 / X48→X49 裁决）。
 //!
-//! **变体分级**（RFC-0002 附录 D + §2.3 法务红线）：
+//! **变体分级**（RFC-0002 附录 D；X49 修订见插件仓 README 审计表）：
 //! - **静态表变体**（qmc0/qmc3/qmcflac/qmc2/qmcogg/bkc*/qm* 旧形态）：
 //!   逐字节 XOR 一个 128 字节静态映射表——**开箱即用基本盘**（R25 对策）。
 //!   算法出处：jixunmoe/qmc-decode（MIT，归档存活仓；README 审计表已登记）。
-//! - **尾标变体**（mflac0/mflac1/mgg0/mgg1/mggl 等，文件尾 `STag`/`QTag` 标记）：
-//!   逐曲 ekey = **账号绑定 DRM** → 按 RFC-0002 §2.3 走 D 级「识别报告」：
-//!   probe 层报 `requires_ekey=true`；migrate 层显式拒绝
-//!   （`QMC-VARIANT-STAG-UNSUPPORTED`，X42 双层错误模型透传业务码）。
-//!   绝不解密、绝不内置 ekey 派生机制（no bundled secrets；参考源亦已消亡：
-//!   unlock-music 于 2022-11 被 DMCA 下架——详见插件仓 README 审计表）。
+//! - **STag 尾标变体**（mflac0/mflac1，文件最末 4 字节 `STag`）：
+//!   **QMCv2 流密码（RC4/Map 变体）+ 用户自备 ekey**（X49：主理人解除暂缓，
+//!   参考源重新核验为存活且 MIT+Apache 双许可——`qmc2v2.rs`）。
+//!   ekey 经 `options.ekey` 本地传递（零网络、无数据库、无 musicex API）。
+//! - **QTag 尾标变体**（mgg0/mgg1/mggl，最末 4 字节 `QTag`）：
+//!   维持 **D 级识别报告**（内嵌 ekey 结构与 STag 不同，参考源未覆盖；
+//!   `QMC-VARIANT-QTAG-UNSUPPORTED` 显式拒绝）。
 //!
-//! **兼容性申报**（PLUGIN_POLICY §4）：静态表变体以合成 fixture 自洽 roundtrip
-//! 钉死（加密端 = 解密端同表镜像）；与真实持有样本的互操作验证 pending——
+//! **兼容性申报**（PLUGIN_POLICY §4）：静态表变体与 QMCv2 变体均以合成 fixture
+//! 自洽 roundtrip + 参考源数值测试钉死；与真实持有样本的互操作验证 pending——
 //! 未经样本验证前按「实验」状态申报。仅处理用户合法持有的本地文件；
 //! 永不联网、永不改源。
 
@@ -66,9 +67,9 @@ pub fn qmc_map_transform(raw: &[u8]) -> Vec<u8> {
 pub enum QmcVariant {
     /// 静态表变体：可直接迁移；`out_ext` 为预期产物扩展名。
     StaticMap { out_ext: &'static str },
-    /// `STag` 尾标（mflac 系）：逐曲 ekey（账号绑定 DRM）——识别报告，不迁移。
+    /// `STag` 尾标（mflac0/mflac1 系）：QMCv2 + 用户自备 ekey（X49 支持解密）。
     StagTail,
-    /// `QTag` 尾标（mgg 系）：同上。
+    /// `QTag` 尾标（mgg 系）：内嵌 ekey 结构，参考源未覆盖——D 级识别报告。
     QtagTail,
     /// 非本插件能力范围。
     Unknown,
@@ -115,11 +116,12 @@ pub fn classify(file_name: &str, tail: &[u8]) -> QmcVariant {
     }
 }
 
-/// 尾部采样中查找尾标 magic（只在最后 64 字节窗口内——STag/QTag 结构
-/// 固定驻留文件末尾，窗口过大会把音频流中的偶然 4 字节序列误判）。
+/// 尾标 magic 判定（X49 收紧：STag/QTag 固定驻留**文件最末 4 字节**——
+/// 参考源 qmc-dec `read_qmc_tag` 的 `SeekFrom::End(-4)` 语义；
+/// 此前 64B 窗口扫描过宽，存在把音频流尾部偶然序列误判的理论面）。
 fn find_tail_magic(tail: &[u8], magic: &[u8; 4]) -> bool {
-    let start = tail.len().saturating_sub(64);
-    tail[start..].windows(4).any(|w| w == magic)
+    let n = tail.len();
+    n >= 4 && &tail[n - 4..] == magic
 }
 
 /// 读文件尾部采样（≤ 256B；文件过短则全文）。
@@ -167,16 +169,29 @@ pub fn handler(method: &str, params: &serde_json::Value) -> Result<serde_json::V
                     // ekey 对静态表变体无意义：显式忽略（不静默当密钥用）
                     qmc_map_transform(raw)
                 }),
-                v @ (QmcVariant::StagTail | QmcVariant::QtagTail) => Err(format!(
-                    "QMC-VARIANT-STAG-UNSUPPORTED: {} 变体为逐曲 ekey（账号绑定 DRM），\
-                     按 RFC-0002 §2.3 仅识别报告、不迁移；\
-                     如你有合法持有的解密授权，请在 issue 中说明场景",
-                    if matches!(v, QmcVariant::StagTail) {
-                        "STag(mflac)"
-                    } else {
-                        "QTag(mgg)"
-                    }
-                )),
+                QmcVariant::StagTail => {
+                    // X49：QMCv2 + 用户自备 ekey（本地传递，零网络）。
+                    // ekey 三态：缺失 → REQUIRED（引导文案）；无效 → INVALID
+                    // （X42 双层错误模型，source_code 透传）。
+                    let Some(ekey) = p.ekey.as_deref() else {
+                        return Err(
+                            "QMC-EKEY-REQUIRED: STag 变体需用户自备 ekey——请从你自己合法登录的 \
+                             QQ 音乐客户端提取后填入（MusicForge 不内置、不联网获取；见插件引导文档）"
+                                .to_string(),
+                        );
+                    };
+                    let cipher = crate::qmc2v2::Qmc2Cipher::from_ekey(ekey).map_err(|_| {
+                        "QMC-EKEY-INVALID: ekey 解析失败——与文件不匹配或格式有误；\
+                         请确认 ekey 完整复制且来自同一文件的所属账号"
+                            .to_string()
+                    })?;
+                    crate::run_migrate(&p, &move |raw, _p| cipher.decrypt(raw))
+                }
+                QmcVariant::QtagTail => Err(
+                    "QMC-VARIANT-QTAG-UNSUPPORTED: QTag(mgg) 变体的内嵌 ekey 结构暂未支持 \
+                     （参考源未覆盖，见插件仓 README 审计表）；本插件仅识别报告，不迁移"
+                        .to_string(),
+                ),
                 QmcVariant::Unknown => {
                     // 非本插件形态：恒等变换 → 产物双验失败 → 隔离区
                     // （失败显式可见，绝不静默删除）
@@ -241,17 +256,24 @@ mod tests {
             classify("song.mgg", &[0u8; 32]),
             QmcVariant::StaticMap { out_ext: "ogg" }
         );
-        // QTag
+        // QTag（X49：magic 必须驻留最末 4 字节——QTag 后缀载荷则不命中）
         let mut qt = vec![0u8; 200];
-        qt.extend_from_slice(b"QTag\x01\x02");
+        qt.extend_from_slice(b"QTag");
         assert_eq!(classify("song.mgg", &qt), QmcVariant::QtagTail);
+        let mut qt_suffix = vec![0u8; 200];
+        qt_suffix.extend_from_slice(b"QTag\x01\x02");
+        assert_eq!(
+            classify("song.mgg", &qt_suffix),
+            QmcVariant::StaticMap { out_ext: "ogg" },
+            "QTag 不在最末 4 字节 → 回退扩展名"
+        );
         // 未知扩展名
         assert_eq!(classify("song.mp3", &[]), QmcVariant::Unknown);
-        // magic 驻留尾部窗口（最后 64B）内 → 命中
+        // magic 驻留最末 4 字节 → 命中
         let mut tail_in = vec![0u8; 60];
         tail_in.extend_from_slice(b"STag"); // 距尾 0
         assert_eq!(classify("song.qmcflac", &tail_in), QmcVariant::StagTail);
-        // magic 距尾 >64B（采样中段偶然序列）→ 不命中，回退扩展名
+        // magic 不在最末 4 字节（采样中段偶然序列）→ 不命中，回退扩展名
         let mut mid = vec![0u8; 64];
         mid.extend_from_slice(b"STag");
         mid.extend_from_slice(&[0u8; 200]); // magic 距尾 204B

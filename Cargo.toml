@@ -1,6 +1,6 @@
 [package]
 name = "musicforge-format-plugins"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "MusicForge local format-migration plugins (L3, network=false) — separate distribution, disabled by default, acknowledgement required"
@@ -25,6 +25,9 @@ lofty = "0.25"
 # 审计行 + KWM 内嵌密钥解出
 sha2 = "0.10"
 aes = "0.8"
+# X49（QMCv2）：ekey 解析（base64）+ 腾讯 TEA 变体解密（crates.io 公开 crate，MIT）
+base64 = "0.22"
+tc_tea = "0.1.4"
 
 [profile.release]
 lto = true

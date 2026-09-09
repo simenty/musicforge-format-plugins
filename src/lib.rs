@@ -19,6 +19,7 @@ use musicforge_plugin_api::{methods, PluginError, PluginManifest, Request, Respo
 
 pub mod kwm;
 pub mod qmc;
+pub mod qmc2v2;
 
 /// format 域方法（P6b 增量；协议信封与 AI 域共用 X8）。
 pub mod fmt_methods {
